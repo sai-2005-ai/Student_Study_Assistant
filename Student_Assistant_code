@@ -1,0 +1,250 @@
+# 📦 Install required libraries (only run once)
+!pip install pdfplumber matplotlib transformers
+!pip install keybert sentence-transformers
+
+
+# 📚 Imports
+import pdfplumber, os, datetime, json, random
+import matplotlib.pyplot as plt
+from keybert import KeyBERT
+from transformers import pipeline, AutoTokenizer, T5ForConditionalGeneration
+from google.colab import files
+
+# --- Load Models ---
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+qa_pipeline = pipeline("question-answering")
+qg_tokenizer = AutoTokenizer.from_pretrained("valhalla/t5-small-qg-prepend")
+qg_model = T5ForConditionalGeneration.from_pretrained("valhalla/t5-small-qg-prepend")
+
+progress_file = "study_progress.json"
+score_file = "quiz_scores.json"
+
+# --- Extract Text ---
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text.strip()
+
+# --- Summarize Text ---
+def summarize_text(text):
+    text = text.replace("\n", " ")
+    sentences = text.split('. ')
+    chunks = []
+    temp = ""
+    for sentence in sentences:
+        temp += sentence + '. '
+        if len(temp) > 900:
+            chunks.append(temp.strip())
+            temp = ""
+    if temp:
+        chunks.append(temp.strip())
+
+    summaries, key_points = [], []
+    for chunk in chunks:
+        try:
+            summary = summarizer(chunk)[0]['summary_text']
+            summaries.append(summary)
+            key_points += [pt.strip().capitalize() + '.' for pt in summary.split('.') if len(pt.strip()) > 10]
+        except:
+            continue
+    return summaries, key_points
+
+
+
+
+# --- Improved Flashcards ---
+def generate_flashcards(text, n=5):
+    sentences = [s.strip() for s in text.replace("\n", " ").split('.') if 20 < len(s.strip()) < 150]
+    flashcards = []
+    used = set()
+    for _ in range(min(n, len(sentences))):
+        while True:
+            candidate = random.choice(sentences)
+            if candidate not in used:
+                used.add(candidate)
+                break
+        question = f"What concept or idea is described in this sentence?\n→ \"{candidate}\""
+        answer = qa_pipeline(question="Summarize the meaning of this sentence.", context=candidate)['answer']
+        flashcards.append((question, answer.strip().capitalize() + '.'))
+    return flashcards
+
+
+
+
+
+
+# --- Smarter MCQs ---
+def generate_mcq(text, num_questions=5):
+    sentences = [s.strip() for s in text.replace("\n", " ").split('.') if len(s.strip()) > 30]
+    questions = []
+    used_contexts = set()
+
+    for _ in range(num_questions):
+        while True:
+            idx = random.randint(0, len(sentences) - 3)
+            context = ". ".join(sentences[idx:idx + 3])
+            if context not in used_contexts:
+                used_contexts.add(context)
+                break
+
+        answer = qa_pipeline(question="What is this passage about?", context=context).get('answer', '').strip()
+        if not answer or len(answer.split()) < 2:
+            continue
+
+        input_ids = qg_tokenizer.encode("generate question: " + context, return_tensors="pt")
+        outputs = qg_model.generate(input_ids)
+        question = qg_tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        distractors = []
+        tries = 0
+        while len(distractors) < 3 and tries < 15:
+            cand = random.choice(sentences)
+            if answer.lower() not in cand.lower() and cand not in distractors:
+                distractors.append(cand.strip().capitalize() + '.')
+            tries += 1
+
+        options = distractors + [answer.strip().capitalize() + '.']
+        random.shuffle(options)
+
+        questions.append({
+            "question": question.strip().capitalize() + '.',
+            "options": options,
+            "answer": answer.strip().capitalize() + '.'
+        })
+
+    return questions
+
+# --- QA pairs ---
+def generate_qa_pairs(text, n=5):
+    sentences = [s.strip() for s in text.replace("\n", " ").split('.') if len(s.strip()) > 30]
+    qa_pairs = []
+    for i in range(min(n, len(sentences) - 3)):
+        context = ". ".join(sentences[i:i+3])
+        input_ids = qg_tokenizer.encode("generate question: " + context, return_tensors="pt")
+        outputs = qg_model.generate(input_ids)
+        question = qg_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        answer = qa_pipeline(question=question, context=context)['answer'].strip()
+        qa_pairs.append((question.strip().capitalize(), answer.strip().capitalize() + '.'))
+    return qa_pairs
+
+# --- Context-aware QA ---
+def answer_question(context, question):
+    return qa_pipeline(question=question, context=context)['answer'].strip().capitalize() + '.'
+
+# --- Save/Plot Progress ---
+def save_progress(summary_count):
+    today = str(datetime.date.today())
+    progress = json.load(open(progress_file)) if os.path.exists(progress_file) else {}
+    progress[today] = progress.get(today, 0) + summary_count
+    with open(progress_file, 'w') as f: json.dump(progress, f)
+
+def plot_progress():
+    if not os.path.exists(progress_file):
+        print("No study progress recorded yet.")
+        return
+    with open(progress_file, 'r') as f:
+        progress = json.load(f)
+    plt.figure(figsize=(8, 4))
+    plt.plot(progress.keys(), progress.values(), marker='o', color='green')
+    plt.title("📊 Daily Study Progress")
+    plt.xlabel("Date")
+    plt.ylabel("Summarized Chunks")
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# --- Save/Plot Scores ---
+def save_quiz_score(score, total):
+    today = str(datetime.date.today())
+    scores = json.load(open(score_file)) if os.path.exists(score_file) else {}
+    scores[today] = {"score": score, "total": total}
+    with open(score_file, 'w') as f: json.dump(scores, f)
+
+def plot_quiz_performance():
+    if not os.path.exists(score_file):
+        print("No quiz scores recorded yet.")
+        return
+    with open(score_file, 'r') as f:
+        scores = json.load(f)
+    dates = list(scores.keys())
+    values = [scores[d]["score"] for d in dates]
+    totals = [scores[d]["total"] for d in dates]
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(dates, values, marker='o', label="Score", color="blue")
+    plt.plot(dates, totals, marker='x', label="Total", color="gray", linestyle='--')
+    plt.title("🧪 Quiz Performance Over Time")
+    plt.xlabel("Date")
+    plt.ylabel("Score")
+    plt.grid(True)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# --- MAIN EXECUTION ---
+
+uploaded = files.upload()
+pdf_path = list(uploaded.keys())[0]
+print(f"✅ File uploaded: {pdf_path}")
+if os.path.exists(pdf_path) and pdf_path.lower().endswith('.pdf'):
+    full_text = extract_text_from_pdf(pdf_path)
+    print("\n✅ PDF text extracted.\n")
+
+    summaries, key_points = summarize_text(full_text)
+    print("📝 Summary:")
+    for i, s in enumerate(summaries, 1): print(f"🔹 {i}. {s}\n")
+    print("🔑 Key Points:")
+    for i, kp in enumerate(key_points, 1): print(f"  • {kp}")
+    save_progress(len(summaries))
+
+    print("\n🧠 Flashcards:")
+    for q, a in generate_flashcards(full_text): print(f"Q: {q}\nA: {a}\n")
+
+    print("❓ Quiz Questions (5 MCQs):")
+    mcqs = generate_mcq(full_text)
+    user_answers = []
+    correct_answers = []
+
+    for i, q in enumerate(mcqs, 1):
+        print(f"\n{i}. {q['question']}")
+        for j, opt in enumerate(q['options']):
+            print(f"   {chr(65 + j)}. {opt}")
+        user_ans = input("👉 Your answer (A/B/C/D): ").strip().upper()
+        user_answers.append(user_ans)
+        correct_index = q['options'].index(q['answer'])
+        correct_answers.append(chr(65 + correct_index))
+
+    score = 0
+    print("\n🧾 Quiz Results:")
+    for i in range(len(mcqs)):
+        result = "✅ Correct" if user_answers[i] == correct_answers[i] else f"❌ Incorrect (Correct: {correct_answers[i]})"
+        print(f"{i+1}. Your Answer: {user_answers[i]} → {result}")
+        if user_answers[i] == correct_answers[i]:
+            score += 1
+
+    print(f"\n🏁 Quiz Completed. You scored {score}/{len(mcqs)}")
+    save_quiz_score(score, len(mcqs))
+    print("📊 Plotting quiz performance...\n")
+    plot_quiz_performance()
+
+    print("\n📚 Question & Answer Pairs:")
+    for i, (q, a) in enumerate(generate_qa_pairs(full_text), 1):
+        print(f"{i}. Q: {q}\n   A: {a}\n")
+
+    print("\n🎯 Ask Questions from Your Study Notes")
+    while True:
+        user_question = input("🔎 Your Question (or type 'exit'): ").strip()
+        if user_question.lower() == 'exit':
+            break
+        print("💡 Answer:", answer_question(full_text, user_question), "\n")
+
+    print("📈 Plotting your daily study summary progress...\n")
+    plot_progress()
+else:
+    print("❌ Invalid PDF path. Please enter a valid path to your PDF file.")
